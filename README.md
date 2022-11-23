@@ -1,4 +1,6 @@
-# vrf-oracle
+# Randomness Beacon (previously VRF Oracle)
+
+This project was moved from https://github.com/ori-shem-tov/vrf-oracle
 
 ## Overview
 
