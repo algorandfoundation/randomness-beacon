@@ -15,6 +15,34 @@
                 {
                     "type": "byte[32]",
                     "name": "vrf_pk"
+                },
+                {
+                    "type": "address",
+                    "name": "rotation_controller"
+                }
+            ],
+            "returns": {
+                "type": "void"
+            }
+        },
+        {
+            "name": "rotate_vrf_key",
+            "args": [
+                {
+                    "type": "byte[32]",
+                    "name": "vrf_pk"
+                }
+            ],
+            "returns": {
+                "type": "void"
+            }
+        },
+        {
+            "name": "rotate_rotation_controller",
+            "args": [
+                {
+                    "type": "address",
+                    "name": "rotation_controller"
                 }
             ],
             "returns": {

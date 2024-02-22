@@ -16,6 +16,7 @@ import (
 
 var (
 	appCreatorMnemonic       string
+	vrfMnemonicString        string // mnemonic for generating the vrf
 	approvalProgramFilename  string
 	clearProgramFilename     string
 	dummyAppApprovalFilename string
@@ -32,12 +33,13 @@ func init() {
 	tools.SetLogger(logLevelEnv)
 
 	DeployAppCmd.Flags().StringVar(&vrfProofString, "vrf-proof", "",
-		"base64 encoding of the VRF proof (required)")
-	tools.MarkFlagRequired(DeployAppCmd.Flags(), "vrf-proof")
+		"base64 encoding of the VRF proof (required if 'vrf-mnemonic' not provided)")
+
+	DeployAppCmd.Flags().StringVar(&vrfMnemonicString, "vrf-mnemonic", "",
+		"25-word mnemonic of the oracle for computing vrf (required if 'vrf-proof' not provided)")
 
 	DeployAppCmd.Flags().StringVar(&vrfPKAddrString, "vrf-pk-addr", "",
-		"the VRF public key as an Algorand address (required)")
-	tools.MarkFlagRequired(DeployAppCmd.Flags(), "vrf-pk-addr")
+		"the VRF public key as an Algorand address (required if 'vrf-mnemonic' not provided)")
 
 	DeployAppCmd.Flags().Uint64Var(&startingRound, "starting-round", 0,
 		"the round to start scanning from (optional. default: current round)")
@@ -68,6 +70,22 @@ var DeployAppCmd = &cobra.Command{
 	Use:   "deploy-app",
 	Short: "deploys the beacon's smart contract",
 	Run: func(cmd *cobra.Command, args []string) {
+		if vrfProofString == "" && vrfMnemonicString == "" {
+			log.Error("must provide either 'vrf-proof' or 'vrf-mnemonic'")
+			return
+		}
+		if vrfProofString != "" && vrfMnemonicString != "" {
+			log.Error("must provide either 'vrf-proof' or 'vrf-mnemonic', not both")
+			return
+		}
+		if vrfPKAddrString == "" && vrfMnemonicString == "" {
+			log.Error("must provide either 'vrf-pk-addr' or 'vrf-mnemonic'")
+			return
+		}
+		if vrfPKAddrString != "" && vrfMnemonicString != "" {
+			log.Error("must provide either 'vrf-pk-addr' or 'vrf-mnemonic', not both")
+			return
+		}
 		err := tools.TestEnvironmentVariables(AlgodAddress)
 		if err != nil {
 			log.Error(err)
@@ -121,24 +139,43 @@ var DeployAppCmd = &cobra.Command{
 			log.Error(err)
 			return
 		}
-		vrfProof, err := base64.StdEncoding.DecodeString(vrfProofString)
-		if err != nil {
-			log.Error(err)
-			return
+		var vrfPKAddr types.Address
+		if vrfPKAddrString != "" {
+			vrfPKAddr, err = types.DecodeAddress(vrfPKAddrString)
+			if err != nil {
+				log.Error(err)
+				return
+			}
 		}
-		vrfPKAddr, err := types.DecodeAddress(vrfPKAddrString)
-		if err != nil {
-			log.Error(err)
-			return
+		if vrfProofString != "" {
+			vrfProof, err := base64.StdEncoding.DecodeString(vrfProofString)
+			if err != nil {
+				log.Error(err)
+				return
+			}
+			appID, err := daemon.DeployABIApp(
+				startingRound, dummyAppID, algodClient, vrfPKAddr[:], appCreatorAccount, appCreatorAccount.Address, vrfProof, approvalBytes,
+				clearBytes, suggestedParams)
+			if err != nil {
+				log.Error(err)
+				return
+			}
+			log.Infof("app id: %d\n", appID)
+		} else {
+			// vrfPrivateKey is key used to generate VRF proofs
+			vrfPrivateKey, err := mnemonic.ToPrivateKey(vrfMnemonicString)
+			if err != nil {
+				log.Errorf("invalid vrf mnemonic: %v", err)
+				return
+			}
+			appID, err := daemon.DeployABIAppWithVRFKey(startingRound, dummyAppID, algodClient, vrfPrivateKey,
+				appCreatorAccount, appCreatorAccount.Address, approvalBytes, clearBytes, suggestedParams)
+			if err != nil {
+				log.Error(err)
+				return
+			}
+			log.Infof("app id: %d\n", appID)
 		}
-		appID, err := daemon.DeployABIApp(
-			startingRound, dummyAppID, algodClient, vrfPKAddr[:], appCreatorAccount, vrfProof, approvalBytes,
-			clearBytes, suggestedParams)
-		if err != nil {
-			log.Error(err)
-			return
-		}
-		log.Infof("app id: %d\n", appID)
 
 	},
 }
