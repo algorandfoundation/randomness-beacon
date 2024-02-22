@@ -114,7 +114,8 @@ def put_last_round_stored(last_round: Expr) -> Expr:
         Concat(
             Itob(last_round),
             Itob(get_first_round_stored()),
-            get_vrf_pk()
+            get_vrf_pk(),
+            get_rotation_controller()
         )
     )
 
@@ -135,7 +136,8 @@ def put_first_round_stored(first_round: Expr) -> Expr:
         Concat(
             Itob(get_last_round_stored()),
             Itob(first_round),
-            get_vrf_pk()
+            get_vrf_pk(),
+            get_rotation_controller()
         )
     )
 
@@ -145,6 +147,43 @@ def get_vrf_pk() -> Expr:
     Return the VRF pk stored in the application state (main slot)
     """
     return Extract(App.globalGet(Bytes('')), Int(16), Int(VRF_PK_LEN))
+
+
+def put_vrf_pk(vrf_pk: Expr) -> Expr:
+    """
+    Update the VRF pk in the application state (main slot)
+    """
+    return App.globalPut(
+        Bytes(''),
+        Concat(
+            Itob(get_last_round_stored()),
+            Itob(get_first_round_stored()),
+            vrf_pk,
+            get_rotation_controller()
+        )
+    )
+
+
+def get_rotation_controller() -> Expr:
+    """
+    Return the rotation controller stored in the application state (main slot)
+    """
+    return Extract(App.globalGet(Bytes('')), Int(16 + VRF_PK_LEN), Int(abi.AddressLength.Bytes.value))
+
+
+def put_rotation_controller(rotation_controller: Expr) -> Expr:
+    """
+    Update the rotation controller in the application state (main slot)
+    """
+    return App.globalPut(
+        Bytes(''),
+        Concat(
+            Itob(get_last_round_stored()),
+            Itob(get_first_round_stored()),
+            get_vrf_pk(),
+            rotation_controller
+        )
+    )
 
 
 def get_stored_vrf_output(rnd: Expr) -> Expr:
@@ -275,7 +314,7 @@ def get_random_output(rnd: Expr, user_data: Expr):
 
 # init global state with a constant value
 @Subroutine(TealType.none)
-def init_global_state(rnd: Expr, vrf_pk: Expr):
+def init_global_state(rnd: Expr, vrf_pk: Expr, rotation_controller: Expr):
     """
     Initialize the global state
     """
@@ -293,7 +332,7 @@ def init_global_state(rnd: Expr, vrf_pk: Expr):
             )
         ),
         # store the initial round and the VRF public key in the main slot
-        App.globalPut(Bytes(''), Concat(Itob(rnd), Itob(rnd), vrf_pk))
+        App.globalPut(Bytes(''), Concat(Itob(rnd), Itob(rnd), vrf_pk, rotation_controller))
     ])
 
 
@@ -361,7 +400,8 @@ def vrf_beacon_abi():
     def create_app(
             round: abi.Uint64,  # pylint: disable=W0622
             vrf_proof: abi.StaticBytes[Literal[VRF_PROOF_LEN]],
-            vrf_pk: abi.StaticBytes[Literal[VRF_PK_LEN]]
+            vrf_pk: abi.StaticBytes[Literal[VRF_PK_LEN]],
+            rotation_controller: abi.Address,
     ):
         # Since no_op=CallConfig.CREATE, this call can only be made at application creation.
         # This is very important, otherwise anyone could reset the beacon VRF and that would be insecure!
@@ -371,9 +411,34 @@ def vrf_beacon_abi():
             Assert(round.get() % Int(VRF_ROUND_MULTIPLE) == Int(0)),
             Assert(Len(vrf_pk.get()) == Int(VRF_PK_LEN)),
             # init global state
-            init_global_state(round.get(), vrf_pk.get()),
+            init_global_state(round.get(), vrf_pk.get(), rotation_controller.get()),
             # verify the VRF proof and store its output in the correct slot
             verify_and_store_vrf(round.get(), vrf_proof.get(), vrf_pk.get()),
+        ])
+
+
+    @router.method(no_op=CallConfig.CALL)
+    def rotate_vrf_key(
+            vrf_pk: abi.StaticBytes[Literal[VRF_PK_LEN]],
+    ):
+        # Note that only the rotation controller can call this function
+        return Seq([
+            # verify the current sender is the rotation controller
+            Assert(Txn.sender() == get_rotation_controller()),
+            # store the new VRF public key in the main slot
+            put_vrf_pk(vrf_pk.get()),
+        ])
+
+    @router.method(no_op=CallConfig.CALL)
+    def rotate_rotation_controller(
+            rotation_controller: abi.Address,
+    ):
+        # Note that only the rotation controller can call this function
+        return Seq([
+            # verify the current sender is the rotation controller
+            Assert(Txn.sender() == get_rotation_controller()),
+            # store the new rotation controller in the main slot
+            put_rotation_controller(rotation_controller.get()),
         ])
 
     @router.method(no_op=CallConfig.CALL)
@@ -454,6 +519,10 @@ def vrf_beacon_abi():
         ])
 
     return router
+
+
+def vrf_beacon_logicsig():
+    return verify_vrf(Txn.application_args[0], Txn.application_args[1], Txn.application_args[2])
 
 
 if __name__ == '__main__':

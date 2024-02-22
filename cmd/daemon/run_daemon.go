@@ -365,7 +365,7 @@ func DeployDummyApp(approvalProgram, clearProgram []byte, appCreatorSK ed25519.P
 
 // DeployABIApp deploys the beacon's smart contract
 func DeployABIApp(startingRound, dummyAppID uint64, algodClient *algod.Client, vrfPublicKey ed25519.PublicKey,
-	appCreatorAccount crypto.Account, vrfProof, approvalBytes, clearBytes []byte,
+	appCreatorAccount crypto.Account, rotationControllerAddress types.Address, vrfProof, approvalBytes, clearBytes []byte,
 	suggestedParams types.SuggestedParams) (uint64, error) {
 	globalStateSchema := types.StateSchema{
 		NumUint:      0,
@@ -378,7 +378,7 @@ func DeployABIApp(startingRound, dummyAppID uint64, algodClient *algod.Client, v
 	}
 	var atc future.AtomicTransactionComposer
 	signer := future.BasicAccountTransactionSigner{Account: appCreatorAccount}
-	methodSig := "create_app(uint64,byte[80],byte[32])void"
+	methodSig := "create_app(uint64,byte[80],byte[32],address)void"
 	method, err := abi.MethodFromSignature(methodSig)
 	if err != nil {
 		return 0, fmt.Errorf("error abi.MethodFromSignature(methodSig) %v", err)
@@ -389,7 +389,7 @@ func DeployABIApp(startingRound, dummyAppID uint64, algodClient *algod.Client, v
 	copy(vrfProofArray[:], vrfProof)
 	methodCallParams := future.AddMethodCallParams{
 		Method:          method,
-		MethodArgs:      []interface{}{startingRound, vrfProofArray, vrfPublicKey[:]},
+		MethodArgs:      []interface{}{startingRound, vrfProofArray, vrfPublicKey[:], rotationControllerAddress},
 		Sender:          appCreatorAccount.Address,
 		SuggestedParams: suggestedParams,
 		OnComplete:      types.NoOpOC,
@@ -450,10 +450,27 @@ func DeployABIApp(startingRound, dummyAppID uint64, algodClient *algod.Client, v
 	return res.ApplicationIndex, nil
 }
 
-// createABIAppWithVRFKey deploys the beacon's smart contract after computing the initial VRF proof to be verified
-func createABIAppWithVRFKey(startingRound, dummyAppID uint64, algodClient *algod.Client,
-	vrfPrivateKey ed25519.PrivateKey, appCreatorAccount crypto.Account, approvalBytes, clearBytes []byte,
-	suggestedParams types.SuggestedParams) (uint64, error) {
+func GetVRFProofForRound(algodClient *algod.Client, round uint64, vrfPrivateKey ed25519.PrivateKey) ([]byte, error) {
+	block, err := getBlock(algodClient, round)
+	if err != nil {
+		return nil, fmt.Errorf("error getting block seed of block %d from algod", round)
+	}
+	blockNumberBytes := convertUint64ToBigEndianBytes(round)
+	_, vrfProof, err := computeAndSignVrf(
+		blockNumberBytes,
+		block.Seed[:],
+		vrfPrivateKey,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("error computing VRF proof: %v", err)
+	}
+	return vrfProof, nil
+}
+
+// DeployABIAppWithVRFKey deploys the beacon's smart contract after computing the initial VRF proof to be verified
+func DeployABIAppWithVRFKey(startingRound, dummyAppID uint64, algodClient *algod.Client,
+	vrfPrivateKey ed25519.PrivateKey, appCreatorAccount crypto.Account, rotationControllerAddress types.Address,
+	approvalBytes, clearBytes []byte, suggestedParams types.SuggestedParams) (uint64, error) {
 
 	log.Infof("getting block seed for %d", startingRound)
 	block, err := getBlock(algodClient, startingRound)
@@ -471,9 +488,12 @@ func createABIAppWithVRFKey(startingRound, dummyAppID uint64, algodClient *algod
 		return 0, fmt.Errorf("failed computing vrf for %d: %v", startingRound, err)
 	}
 	log.Debugf("proof B64 is %s", base64.StdEncoding.EncodeToString(vrfProof))
+	if vrfOutputsHistory == nil {
+		vrfOutputsHistory = make(map[uint64][]byte)
+	}
 	vrfOutputsHistory[startingRound] = vrfOutput
 	return DeployABIApp(startingRound, dummyAppID, algodClient, vrfPrivateKey.Public().(ed25519.PublicKey),
-		appCreatorAccount, vrfProof, approvalBytes, clearBytes, suggestedParams)
+		appCreatorAccount, rotationControllerAddress, vrfProof, approvalBytes, clearBytes, suggestedParams)
 }
 
 // CompileTeal compiles an approval and clear programs given 2 corresponding TEAL script files
@@ -539,7 +559,7 @@ func ceilingToMultipleOfX(num, x uint64) uint64 {
 // mainLoop is the main function of the daemon that computes and submits VRF proofs and runs tests round by round.
 // It stops running only in case of an error or an interrupt
 func mainLoop(appID, dummyAppID, startingRound uint64, algodClient *algod.Client,
-	vrfPrivateKey ed25519.PrivateKey, serviceAccount crypto.Account) {
+	vrfPrivateKey ed25519.PrivateKey, serviceAccount, rotationControllerAccount crypto.Account) {
 	currentRoundHandled := startingRound + VrfRoundMultiple
 	isRecovering := false
 	for {
@@ -595,7 +615,11 @@ func mainLoop(appID, dummyAppID, startingRound uint64, algodClient *algod.Client
 				return
 			}
 			if !isRecovering {
-				err = runSomeTests(currentRoundHandled, appID, dummyAppID, serviceAccount, algodClient)
+				newVrfAccount := crypto.GenerateAccount()
+				vrfPrivateKey = newVrfAccount.PrivateKey
+				log.Infof("new VRF key: %v", newVrfAccount.PrivateKey.Public().(ed25519.PublicKey))
+				err = runSomeTests(currentRoundHandled, appID, dummyAppID, serviceAccount, rotationControllerAccount,
+					newVrfAccount.PrivateKey.Public().(ed25519.PublicKey), algodClient)
 				if err != nil {
 					log.Errorf("failed tests: %v", err)
 					return
@@ -681,6 +705,34 @@ var RunDaemonCmd = &cobra.Command{
 			sendDummyTxn(algodClient, serviceAccount, suggestedParams)
 		}
 
+		//creating the rotation controller account and fund it
+		log.Info("creating the rotation controller account...")
+		rotationControllerAccount := crypto.GenerateAccount()
+		txn, err := future.MakePaymentTxn(
+			serviceAccount.Address.String(),
+			rotationControllerAccount.Address.String(),
+			1000000,
+			nil,
+			"",
+			suggestedParams,
+		)
+		if err != nil {
+			log.Error(err)
+			return
+		}
+		_, stx, err := crypto.SignTransaction(serviceAccount.PrivateKey, txn)
+		if err != nil {
+			log.Error(err)
+			return
+		}
+		_, err = algodClient.SendRawTransaction(stx).Do(context.Background())
+		if err != nil {
+			log.Error(err)
+			return
+		}
+
+		log.Info("rotation controller account created: %s", rotationControllerAccount.Address.String())
+
 		log.Info("creating dummy app...")
 		dummyApprovalBytes, dummyClearBytes, err := CompileTeal(dummyAppApprovalFilename, dummyAppClearFilename,
 			algodClient)
@@ -702,9 +754,9 @@ var RunDaemonCmd = &cobra.Command{
 			return
 		}
 		vrfOutputsHistory = make(map[uint64][]byte)
-		appID, err := createABIAppWithVRFKey(
+		appID, err := DeployABIAppWithVRFKey(
 			startingRound, dummyAppID, algodClient, vrfPrivateKey,
-			serviceAccount, approvalBytes, clearBytes, suggestedParams)
+			serviceAccount, rotationControllerAccount.Address, approvalBytes, clearBytes, suggestedParams)
 		if err != nil {
 			log.Error(err)
 			return
@@ -722,6 +774,7 @@ var RunDaemonCmd = &cobra.Command{
 			algodClient,
 			vrfPrivateKey,
 			serviceAccount,
+			rotationControllerAccount,
 		)
 		//cmd.HelpFunc()(cmd, args)
 	},

@@ -26,8 +26,8 @@ import (
 // serviceAccount is the account used to send the test transactions
 // algodClient is the algod client used to send transactions. These tests assume that this algod is running in
 // sandbox dev mode
-func runSomeTests(lastSubmittedRound, appID, dummyAppID uint64, serviceAccount crypto.Account,
-	algodClient *algod.Client) error {
+func runSomeTests(lastSubmittedRound, appID, dummyAppID uint64, serviceAccount, rotationControllerAccount crypto.Account,
+	newVrfKey ed25519.PublicKey, algodClient *algod.Client) error {
 
 	sp, err := GetSuggestedParams(algodClient)
 	if err != nil {
@@ -48,6 +48,11 @@ func runSomeTests(lastSubmittedRound, appID, dummyAppID uint64, serviceAccount c
 
 	// Test that trying to submit to VRF proofs to the smart contract with invalid rounds fails
 	err = testSubmissionWithInvalidRounds(lastSubmittedRound, appID, dummyAppID, serviceAccount, algodClient, sp)
+	if err != nil {
+		return err
+	}
+
+	err = testRotateVrfKeySucceed(appID, rotationControllerAccount, newVrfKey, algodClient, sp)
 	if err != nil {
 		return err
 	}
@@ -75,18 +80,18 @@ func testSubmissionWithInvalidRounds(lastSubmittedRound, appID, dummyAppID uint6
 	// this error message is returned when trying to submit a VRF proof for a round outside the valid range
 	// meaning not submitting the subsequent proof to the last submitted one and not submitting a proof as part of the
 	// recovery mode. see 'Disaster recovery' in ./DESIGN.md
-	errMsgInvalidRange := "logic eval error: assert failed pc=693. Details: pc=693, " +
-		"opcodes=callsub label23\\n||\\nassert\\n"
+	errMsgInvalidRange := "logic eval error: assert failed pc=847. Details: pc=847, " +
+		"opcodes=callsub label27; ||; assert"
 
 	// this error message is returned when an invalid VRF proof was submitted. reasons for an invalid proof are:
 	// 1. wrong VRF private key
 	// 2. wrong input to the VRF prove function i.e. wrong round number, wrong block seed or both.
-	errMsgInvalidVRFProof := "logic eval error: assert failed pc=386. Details: pc=386, " +
-		"opcodes=intc_2 // 1\\n==\\nassert\\n"
+	errMsgInvalidVRFProof := "logic eval error: assert failed pc=463. Details: pc=463, " +
+		"opcodes=intc_2 // 1; ==; assert"
 
 	// this error message is returned when an overflow occurs when providing a very big round number
-	errMsgOverflow := "logic eval error: + overflowed. Details: pc=629, " +
-		"opcodes=load 43\\npushint 1000\\n+\\n"
+	errMsgOverflow := "logic eval error: + overflowed. Details: pc=711, " +
+		"opcodes=load 50; pushint 1000; +"
 
 	// Test trying to submit a VRF proof with MaxUint64 as input round
 	err = testFailedSubmit(math.MaxUint64, latestRound, serviceAccount, appID, dummyAppID, algodClient, sp,
@@ -154,7 +159,8 @@ func testOutOfRangeRounds(lastSubmittedRound, appID uint64, serviceAccount crypt
 
 	// Test 'must_get' method call with round lower than range
 	log.Debugf("testing 'must_get' with round lower than range")
-	err := testGetOrMustGetFail(lastSubmittedRound-NbStoredVrfOutputs*VrfRoundMultiple, appID, serviceAccount, sp,
+	goBack := uint64(math.Min(float64(lastSubmittedRound-1), float64(NbStoredVrfOutputs*VrfRoundMultiple)))
+	err := testGetOrMustGetFail(lastSubmittedRound-goBack, appID, serviceAccount, sp,
 		algodClient, "must_get")
 	if err != nil {
 		return fmt.Errorf("error testMustGetFail: %v", err)
@@ -162,7 +168,7 @@ func testOutOfRangeRounds(lastSubmittedRound, appID uint64, serviceAccount crypt
 
 	// Test 'get' method call with round lower than range
 	log.Debugf("testing 'get' with round lower than range")
-	err = testGetOrMustGetFail(lastSubmittedRound-NbStoredVrfOutputs*VrfRoundMultiple, appID, serviceAccount, sp,
+	err = testGetOrMustGetFail(lastSubmittedRound-goBack, appID, serviceAccount, sp,
 		algodClient, "get")
 	if err != nil {
 		return fmt.Errorf("error testGetFail: %v", err)
@@ -449,7 +455,7 @@ func testGetOrMustGetFail(round, appID uint64, serviceAccount crypto.Account, sp
 		//log.Debugf("err is %v", err)
 		if err == nil || !strings.Contains(
 			err.Error(),
-			"logic eval error: assert failed pc=862. Details: pc=862, opcodes=load 14\\ncallsub label26\\nassert\\n",
+			"logic eval error: assert failed pc=1034. Details: pc=1034, opcodes=load 17; callsub label30; assert",
 		) {
 			return fmt.Errorf("error in atc.Execute for round %d: expected failure got err == %v", round, err)
 		}
@@ -508,6 +514,71 @@ func addGetOrMustGetMethodCall(atc *future.AtomicTransactionComposer, round, app
 		Method:          method,
 		MethodArgs:      []interface{}{round, userData},
 		Sender:          serviceAccount.Address,
+		SuggestedParams: sp,
+		Note:            nil,
+		Signer:          signer,
+	}
+	err = atc.AddMethodCall(methodCallParams)
+	if err != nil {
+		return fmt.Errorf("error atc.AddMethodCall(methodCallParams) %v", err)
+	}
+	return nil
+}
+
+func testRotateVrfKeySucceed(appID uint64, account crypto.Account, newVrfKey ed25519.PublicKey,
+	algodClient *algod.Client, sp types.SuggestedParams) error {
+	var atc future.AtomicTransactionComposer
+	err := addRotateVrfKeyMethodCall(&atc, appID, account, sp, newVrfKey)
+	if err != nil {
+		return fmt.Errorf("error in addRotateVrfKeyMethodCall: %v", err)
+	}
+	result, err := atc.Execute(algodClient, context.Background(), 3)
+	if err != nil {
+		return fmt.Errorf("error in atc.Execute: %v", err)
+	}
+	if len(result.TxIDs) < 1 {
+		return fmt.Errorf("didn't get TxIDs")
+	}
+	return nil
+}
+
+func addRotateVrfKeyMethodCall(atc *future.AtomicTransactionComposer, appID uint64,
+	account crypto.Account, sp types.SuggestedParams, newVrfKey ed25519.PublicKey) error {
+	signer := future.BasicAccountTransactionSigner{Account: account}
+	methodSig := "rotate_vrf_key(byte[32])void"
+	method, err := abi.MethodFromSignature(methodSig)
+	if err != nil {
+		return fmt.Errorf("error abi.MethodFromSignature(methodSig) %v", err)
+	}
+	methodCallParams := future.AddMethodCallParams{
+		AppID:           appID,
+		Method:          method,
+		MethodArgs:      []interface{}{newVrfKey[:]},
+		Sender:          account.Address,
+		SuggestedParams: sp,
+		Note:            nil,
+		Signer:          signer,
+	}
+	err = atc.AddMethodCall(methodCallParams)
+	if err != nil {
+		return fmt.Errorf("error atc.AddMethodCall(methodCallParams) %v", err)
+	}
+	return nil
+}
+
+func addRotateRotationControllerMethodCall(atc *future.AtomicTransactionComposer, appID uint64,
+	account crypto.Account, sp types.SuggestedParams, newController types.Address) error {
+	signer := future.BasicAccountTransactionSigner{Account: account}
+	methodSig := "rotate_rotation_controller(address)void"
+	method, err := abi.MethodFromSignature(methodSig)
+	if err != nil {
+		return fmt.Errorf("error abi.MethodFromSignature(methodSig) %v", err)
+	}
+	methodCallParams := future.AddMethodCallParams{
+		AppID:           appID,
+		Method:          method,
+		MethodArgs:      []interface{}{newController},
+		Sender:          account.Address,
 		SuggestedParams: sp,
 		Note:            nil,
 		Signer:          signer,
